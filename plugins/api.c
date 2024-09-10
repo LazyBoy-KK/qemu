@@ -59,6 +59,12 @@
 #endif
 #endif
 
+#ifdef TARGET_HPPA
+#define STACK_GROWS_DOWN 0
+#else
+#define STACK_GROWS_DOWN 1
+#endif
+
 /* Uninstall and Reset handlers */
 
 void qemu_plugin_uninstall(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)
@@ -471,6 +477,36 @@ uint64_t qemu_plugin_end_code(void)
 #endif
     return end;
 }
+
+#if 1
+uint64_t qemu_plugin_stack_low_addr(void)
+{
+    uint64_t low = 0;
+#ifdef CONFIG_USER_ONLY
+    TaskState *ts = get_task_state(current_cpu);
+    if (STACK_GROWS_DOWN) {
+        low = ts->info->stack_limit;
+    } else {
+        low = ts->info->start_stack;
+    }
+#endif
+    return low;
+}
+
+uint64_t qemu_plugin_stack_high_addr(void)
+{
+    uint64_t high = 0;
+#ifdef CONFIG_USER_ONLY
+    TaskState *ts = get_task_state(current_cpu);
+    if (STACK_GROWS_DOWN) {
+        high = ts->info->start_stack;
+    } else {
+        high = ts->info->stack_limit;
+    }
+#endif
+    return high;
+}
+#endif
 
 uint64_t qemu_plugin_entry_code(void)
 {

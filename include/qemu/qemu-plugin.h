@@ -815,6 +815,14 @@ uint64_t qemu_plugin_start_code(void);
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_end_code(void);
 
+#if 1
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_stack_low_addr(void);
+
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_stack_high_addr(void);
+#endif
+
 /**
  * qemu_plugin_entry_code() - returns start address for module
  *

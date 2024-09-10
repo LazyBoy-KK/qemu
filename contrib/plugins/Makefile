@@ -17,6 +17,7 @@ NAMES += execlog
 NAMES += hotblocks
 NAMES += hotpages
 NAMES += howvec
+NAMES += wa2x
 
 # The lockstep example communicates using unix sockets,
 # and can't be easily made to work on windows.
