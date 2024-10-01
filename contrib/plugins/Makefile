@@ -17,7 +17,7 @@ NAMES += execlog
 NAMES += hotblocks
 NAMES += hotpages
 NAMES += howvec
-NAMES += wa2x
+NAMES += wasm
 
 # The lockstep example communicates using unix sockets,
 # and can't be easily made to work on windows.
@@ -71,6 +71,11 @@ lib%$(SO_SUFFIX): %.o
 		$(CC) -bundle -Wl$(COMMA)-undefined$(COMMA)dynamic_lookup -o $@ $^ $(LDLIBS), \
 		LINK, plugin $@)
 else
+libwasm$(SO_SUFFIX): wasm.o backend.o
+	$(call quiet-command, \
+		$(CC) -shared -o $@ $^ $(LDLIBS), \
+		LINK, plugin $@)
+
 lib%$(SO_SUFFIX): %.o
 	$(call quiet-command, \
 		$(CC) -shared -o $@ $^ $(LDLIBS), \

@@ -1,24 +1,45 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <glib.h>
 #include <qemu-plugin.h>
+#include "backend.h"
 
 struct insn_vaddr_list {
     uint64_t vaddr;
     struct insn_vaddr_list *next;
 };
 
-enum {
-	ACCESS_STACK = 0,
-	ACCESS_LINEAR_MEM,
-	ACCESS_PLT,
-	ACCESS_VMCTX,
-	ACCESS_EXECENV,
-	ACCESS_OTHER
+enum InsKind {
+	MEM_ACCESS_STACK = 0,
+	MEM_ACCESS_LINEAR_MEM,
+	MEM_ACCESS_PLT,
+	MEM_ACCESS_VMCTX,
+	MEM_ACCESS_EXECENV,
+	MEM_ACCESS_OTHER,
+
+	UNCOND_BRANCH_INS,
+	COND_BRANCH_INS,
+	CALL_INS,
+	RET_INS,
+};
+
+struct br_insn_list {
+	uint64_t insn_vaddr;
+	uint64_t target_addr;
+	bool is_cond;
+	uint32_t insn_size;
+	uint8_t *insn_data;
+	struct br_insn_list *next;
 };
 
 const uint8_t LAST_CONTENT = 0x23;
+const uint8_t INS_IN_CODE = 0x01;
+const uint8_t INS_IN_PLT = 0x02;
+const uint8_t TARGET_IN_CODE = 0x04;
+const uint8_t TARGET_IN_PLT = 0x08;
+
 const char *code_addr_file_path = NULL;
 uint64_t insn_low_addr = 0, insn_high_addr = 0, base_obj_addr = 0;
 int64_t code_offset = 0;
@@ -28,9 +49,11 @@ uint64_t linear_mem_low_addr = 0, linear_mem_high_addr = 0;
 uint64_t plt_low_addr = 0, plt_high_addr = 0;
 uint64_t vmctx_low_addr = 0, vmctx_high_addr = 0, execenv_low_addr = 0, execenv_high_addr = 0;
 struct insn_vaddr_list *head = NULL;
+struct br_insn_list *br_head = NULL, *last_br = NULL;
 FILE *output = NULL;
 // 0: wa2x 1: wamr 2: wasmtime
 uint32_t runtime_mode = 0;
+GArray *reg_list;
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -79,12 +102,30 @@ void update_stack_addr_space(void) {
     stack_high_addr = qemu_plugin_stack_high_addr();
 }
 
-void serialize_record(uint8_t kind, uint8_t is_load, uint64_t addr, uint64_t size, uint64_t offset) {
+void serialize_mem_access_record(uint8_t kind, uint8_t is_load, uint64_t addr, uint64_t size, uint64_t offset) {
 	fwrite((void *)&kind, sizeof(uint8_t), 1, output);
-	fwrite((void *)&addr, sizeof(uint64_t), 1, output);
 	fwrite((void *)&offset, sizeof(uint64_t), 1, output);
 	fwrite((void *)&is_load, sizeof(uint8_t), 1, output);
+	fwrite((void *)&addr, sizeof(uint64_t), 1, output);
 	fwrite((void *)&size, sizeof(uint64_t), 1, output);
+}
+
+void serialize_branch_record(uint8_t kind, uint64_t target_addr, uint64_t offset, uint8_t mode, uint8_t taken) {
+	// fprintf(stderr, "kind:%d offset:%lx target_addr:%lx\n", kind, offset, target_addr);
+	fwrite((void *)&kind, sizeof(uint8_t), 1, output);
+	fwrite((void *)&offset, sizeof(uint64_t), 1, output);
+	fwrite((void *)&target_addr, sizeof(uint64_t), 1, output);
+	fwrite((void *)&mode, sizeof(uint8_t), 1, output);
+	if (kind == COND_BRANCH_INS) {
+		fwrite((void *)&taken, sizeof(uint8_t), 1, output);
+	}
+}
+
+void serialize_ret_record(uint8_t kind, uint64_t offset, uint8_t in_plt) {
+	// fprintf(stderr, "kind:%d offset:%lx in_plt:%d\n", kind, offset, in_plt);
+	fwrite((void *)&kind, sizeof(uint8_t), 1, output);
+	fwrite((void *)&offset, sizeof(uint64_t), 1, output);
+	fwrite((void *)&in_plt, sizeof(uint8_t), 1, output);
 }
 
 void update_linear_mem_addr_space(void) {
@@ -165,30 +206,30 @@ uint8_t mem_access_kind(uint64_t *addr, uint64_t *insn_addr) {
     if (*addr >= stack_low_addr && *addr <= stack_high_addr) {
 		*addr -= stack_low_addr;
 		*insn_addr -= insn_low_addr;
-		return ACCESS_STACK;
+		return MEM_ACCESS_STACK;
         // return "stack";
     } else if (*addr >= linear_mem_low_addr && *addr <= linear_mem_high_addr) {
 		*addr -= linear_mem_low_addr;
 		*insn_addr -= insn_low_addr;
-		return ACCESS_LINEAR_MEM;
+		return MEM_ACCESS_LINEAR_MEM;
         // return "linear memory";
     } else if (in_plt_sec(*insn_addr)) {
 		*insn_addr -= plt_low_addr;
-		return ACCESS_PLT;
+		return MEM_ACCESS_PLT;
         // return "plt";
     } else if (*addr >= vmctx_low_addr && *addr <= vmctx_high_addr) {
 		*addr -= vmctx_low_addr;
 		*insn_addr -= insn_low_addr;
-		return ACCESS_VMCTX;
+		return MEM_ACCESS_VMCTX;
 		// return runtime_mode == 1 ? "module inst" : "vmctx";
 	} else if (*addr >= execenv_low_addr && *addr <= execenv_high_addr) {
 		*addr -= execenv_low_addr;
 		*insn_addr -= insn_low_addr;
-		return ACCESS_EXECENV;
+		return MEM_ACCESS_EXECENV;
 		// return "exec env";
 	} else {
 		*insn_addr -= insn_low_addr;
-		return ACCESS_OTHER;
+		return MEM_ACCESS_OTHER;
         // return "other";
     }
 }
@@ -202,7 +243,7 @@ void mem_cb(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
 	if (vmctx_low_addr == 0 && vmctx_high_addr == 0 && !update_vmctx_addr()) {
 		return;
 	}
-	
+
     update_linear_mem_addr_space();
 
     struct insn_vaddr_list *node = (struct insn_vaddr_list *)userdata;
@@ -219,8 +260,61 @@ void mem_cb(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
     }
 	uint64_t insn_vaddr = node->vaddr;
     uint8_t kind = mem_access_kind(&vaddr, &insn_vaddr);
-	serialize_record(kind, !is_store, vaddr, 1ll << shift, insn_vaddr);
-    // fprintf(output, "%s %s %lx, size:%lld, offset:%lx\n", kind, is_store ? "store" : "load", vaddr, 1ll << shift, cal_offset(node->vaddr));
+	serialize_mem_access_record(kind, !is_store, vaddr, 1ll << shift, insn_vaddr);
+}
+
+void br_cb(unsigned int vcpu_index, void *userdata) {
+	if (insn_low_addr == 0 && insn_high_addr == 0 && !update_insn_addr_space()) {
+        return;
+    }
+	if (last_br == NULL) {
+		return;
+	}
+	struct insn_vaddr_list *node = (struct insn_vaddr_list *)userdata;
+
+	bool insn_in_plt = in_plt_sec(last_br->insn_vaddr);
+	bool insn_in_code = in_code_sec(last_br->insn_vaddr);
+	bool target_in_plt = in_plt_sec(last_br->target_addr);
+	bool target_in_code = in_code_sec(last_br->target_addr);
+
+	uint64_t insn_vaddr = last_br->insn_vaddr;
+	uint64_t target_addr = last_br->target_addr;
+
+	if (insn_in_code) {
+		insn_vaddr -= insn_low_addr;
+	} else if (insn_in_plt) {
+		insn_vaddr -= plt_low_addr;
+	}
+
+	if (target_in_code) {
+		target_addr -= insn_low_addr;
+	} else if (target_in_plt) {
+		target_addr -= plt_low_addr;
+	}
+
+	uint8_t mode = (insn_in_code) | (insn_in_plt << 1) | (target_in_code << 2) | (target_in_plt << 3);
+
+	serialize_branch_record(last_br->is_cond ? COND_BRANCH_INS : UNCOND_BRANCH_INS, target_addr, insn_vaddr, mode, node->vaddr == last_br->target_addr);
+
+	last_br = NULL;
+}
+
+void br_record_cb(unsigned int vcpu_index, void *userdata) {
+	if (insn_low_addr == 0 && insn_high_addr == 0 && !update_insn_addr_space()) {
+        return;
+    }
+
+	struct br_insn_list *node = (struct br_insn_list *)userdata;
+
+	if (node->target_addr == 0) {
+		node->target_addr = get_branch_target_address(node->insn_data, node->insn_size, node->insn_vaddr, reg_list);
+	}
+
+	if (!is_aot_code(node->target_addr) && !is_aot_code(node->insn_vaddr)) {
+		return;
+	}
+
+	last_br = node;
 }
 
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
@@ -230,13 +324,33 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
     for (size_t i = 0; i < n_insns; ++ i) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-        struct insn_vaddr_list *node = malloc(sizeof(struct insn_vaddr_list));
+		size_t insn_size = qemu_plugin_insn_size(insn);
+		uint8_t *insn_data = malloc(insn_size);
+		qemu_plugin_insn_data(insn, insn_data, insn_size);
+		struct insn_vaddr_list *node = malloc(sizeof(struct insn_vaddr_list));
         node->vaddr = qemu_plugin_insn_vaddr(insn);
         node->next = head->next;
         head->next = node;
-        qemu_plugin_register_vcpu_mem_cb(insn, mem_cb, 
+		qemu_plugin_register_vcpu_insn_exec_cb(insn, br_cb, QEMU_PLUGIN_CB_NO_REGS, node);
+
+		qemu_plugin_register_vcpu_mem_cb(insn, mem_cb, 
                                          QEMU_PLUGIN_CB_NO_REGS,
                                          QEMU_PLUGIN_MEM_RW, (void *)node);
+
+		if (is_branch(insn_data, insn_size)) {
+			struct br_insn_list *br_node = malloc(sizeof(struct br_insn_list));
+			br_node->insn_vaddr = qemu_plugin_insn_vaddr(insn);
+			br_node->is_cond = !is_uncond_branch(insn_data, insn_size);
+			br_node->insn_data = insn_data;
+			br_node->insn_size = insn_size;
+			br_node->target_addr = 0;
+			br_node->next = br_head->next;
+			br_head->next = br_node;
+			qemu_plugin_register_vcpu_insn_exec_cb(insn, br_record_cb, QEMU_PLUGIN_CB_R_REGS, (void *)br_node);
+		} else {
+			free(insn_data);
+		}
+
     }
 }
 
@@ -252,9 +366,17 @@ void vcpu_atexit(qemu_plugin_id_t id, void *userdata) {
         free(p);
     }
     free(head);
+	while(br_head->next) {
+		struct br_insn_list *p = br_head->next;
+		br_head->next = p->next;
+		free(p->insn_data);
+		free(p);
+	}
+	free(br_head);
+	g_array_free(reg_list, true);
 }
 
-const char * search_addr_file(const char *env, const char *def) {
+const char *search_addr_file(const char *env, const char *def) {
 	const char *path = getenv(env);
 	if (!path) {
 		path = def;
@@ -266,6 +388,16 @@ const char * search_addr_file(const char *env, const char *def) {
 void init(void) {
 	code_addr_file_path = search_addr_file("CODE_ADDR_PATH", "/tmp/code_addr.txt");
 	search_addr_file("VMCTX_PATH", "/tmp/vmctx.txt");
+	head = malloc(sizeof(struct insn_vaddr_list));
+    head->vaddr = 0;
+    head->next = NULL;
+	br_head = malloc(sizeof(struct br_insn_list));
+	br_head->insn_vaddr = br_head->target_addr = 0;
+	br_head->next = NULL;
+}
+
+void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
+	reg_list = qemu_plugin_get_registers();
 }
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
@@ -302,9 +434,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
 	fwrite((void *)&runtime_mode, sizeof(uint8_t), 1, output);
-    head = malloc(sizeof(struct insn_vaddr_list));
-    head->vaddr = 0;
-    head->next = NULL;
+	qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_atexit_cb(id, vcpu_atexit, NULL);
     return 0;
