@@ -43,7 +43,7 @@ const uint8_t TARGET_IN_PLT = 0x08;
 const char *code_addr_file_path = NULL;
 uint64_t insn_low_addr = 0, insn_high_addr = 0, base_obj_addr = 0;
 int64_t code_offset = 0;
-uint64_t stack_low_addr = 0, stack_high_addr = 0;
+uint64_t stack_low_addr = 0, stack_high_addr = 0, stack_base_addr = 0;
 uint64_t total_load = 0, total_store = 0;
 uint64_t linear_mem_low_addr = 0, linear_mem_high_addr = 0;
 uint64_t plt_low_addr = 0, plt_high_addr = 0;
@@ -147,6 +147,23 @@ void update_linear_mem_addr_space(void) {
     remove(addr_file_path);
 }
 
+void update_stack_base_addr(void) {
+    char *addr_file_path = getenv("STACK_BASE_ADDR");
+    if (!addr_file_path) {
+        addr_file_path = "/tmp/stack_base.txt";
+    }
+    FILE *f = fopen(addr_file_path, "r");
+    if (f == NULL) {
+        return;
+    }
+    if (fscanf(f, "%ld", &stack_base_addr) != 1) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    remove(addr_file_path);
+}
+
 bool read_vmctx_addr(FILE *f) {
 	size_t vmctx_size = 0, execenv_size = 0;
 	switch (runtime_mode) {
@@ -204,7 +221,11 @@ bool is_aot_code(uint64_t addr) {
 
 uint8_t mem_access_kind(uint64_t *addr, uint64_t *insn_addr) {
     if (*addr >= stack_low_addr && *addr <= stack_high_addr) {
-		*addr -= stack_low_addr;
+		if (in_code_sec(*insn_addr) && stack_base_addr) {
+			*addr = stack_base_addr - *addr;
+		} else {
+			*addr -= stack_low_addr;
+		}
 		*insn_addr -= insn_low_addr;
 		return MEM_ACCESS_STACK;
         // return "stack";
@@ -245,6 +266,7 @@ void mem_cb(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
 	}
 
     update_linear_mem_addr_space();
+	update_stack_base_addr();
 
     struct insn_vaddr_list *node = (struct insn_vaddr_list *)userdata;
     if (!is_aot_code(node->vaddr)) {
