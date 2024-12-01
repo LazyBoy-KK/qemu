@@ -410,6 +410,7 @@ const char *search_addr_file(const char *env, const char *def) {
 void init(void) {
 	code_addr_file_path = search_addr_file("CODE_ADDR_PATH", "/tmp/code_addr.txt");
 	search_addr_file("VMCTX_PATH", "/tmp/vmctx.txt");
+	search_addr_file("STACK_BASE_ADDR", "/tmp/stack_base.txt");
 	head = malloc(sizeof(struct insn_vaddr_list));
     head->vaddr = 0;
     head->next = NULL;
